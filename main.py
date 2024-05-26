@@ -9,7 +9,6 @@ from tkinter import ttk
 import asyncio
 import threading
 import soundcard as sc
-import numpy as np
 from amazon_transcribe.client import TranscribeStreamingClient
 from amazon_transcribe.handlers import TranscriptResultStreamHandler
 from amazon_transcribe.model import TranscriptEvent
@@ -18,6 +17,8 @@ import logging
 import wave
 import configparser
 from make_summary import make_summary
+from audio_processing import audio_stream_generator
+
 
 # Set up logging
 logging.basicConfig(filename='app.log', level=logging.ERROR)
@@ -46,10 +47,6 @@ BYTES_PER_SAMPLE = 2  # Bytes per sample: 2 bytes for 16-bit PCM
 # Create the output file directory if it doesn't exist
 if not os.path.exists(FILE_PATH):
     os.makedirs(FILE_PATH)
-
-async def write_to_wave_file(wav_file, data):
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, wav_file.writeframes, data)
 
 class MyTranscriptResultStreamHandler(TranscriptResultStreamHandler):
     def __init__(self, ui, file_name, *args, **kwargs):
@@ -156,6 +153,7 @@ class TranscribeUI:
             self.mic_menu.config(state="disabled")
             self.speaker_menu.config(state="disabled")
             self.file_name = self.file_name_entry.get()  # Get the file name
+            self.transcription_text.delete("1.0", tk.END) # Clear the transcription text box
             # Set up and open the WAV file
             if SAVE_AUDIO_ENABLED:
                 wav_file_name = self.file_name + ".wav"
@@ -194,49 +192,29 @@ class TranscribeUI:
         asyncio.set_event_loop(loop)
         loop.run_forever()
 
-    async def audio_stream_generator(self, stream):
-        # Send audio from microphone and speaker to the stream
-        selected_mic = sc.get_microphone(self.mic_var.get())
-        selected_speaker = sc.get_speaker(self.speaker_var.get())
-        with selected_mic.recorder(samplerate=SAMPLE_RATE) as mic_recorder, \
-             sc.get_microphone(id=str(selected_speaker.id), include_loopback=True).recorder(samplerate=SAMPLE_RATE) as speaker_mic_recorder:
-            while True:
-                mic_data = mic_recorder.record(numframes=CHUNK_SIZE) if self.mic_enabled.get() else np.zeros((CHUNK_SIZE, 1), dtype=np.float32)
-                speaker_data = speaker_mic_recorder.record(numframes=CHUNK_SIZE) if self.speaker_enabled.get() else np.zeros((CHUNK_SIZE, 1), dtype=np.float32)
-                stereo_data = np.zeros((CHUNK_SIZE, 2), dtype=np.int16)
-                stereo_data[:, 0] = np.round(mic_data[:, 0] * 32767).astype(np.int16)
-                stereo_data[:, 1] = np.round(speaker_data[:, 0] * 32767).astype(np.int16)
-                pcm_data = stereo_data.flatten().astype(np.int16).tobytes()
-                # Add to the buffer
-                if SAVE_AUDIO_ENABLED and self.wav_file:
-                    self.audio_buffer += pcm_data
-                    if len(self.audio_buffer) > self.buffer_limit:
-                        # Call asynchronous write
-                        await write_to_wave_file(self.wav_file, self.audio_buffer)
-                        self.audio_buffer = bytearray()  # Clear the buffer
-
-                await stream.input_stream.send_audio_event(audio_chunk=pcm_data)
-
     async def transcribe_stream(self):
         # Speech recognition and transcription using Amazon Transcribe
         client = TranscribeStreamingClient(region=TRANSCRIBE_REGION)
-        transcribe_kwargs = {
-            "language_code": LANGUAGE_CODE,
-            "media_sample_rate_hz": SAMPLE_RATE,
-            "media_encoding": "pcm",
-            "number_of_channels": 2,
-            "enable_channel_identification": True,
-        }
-        # Enable custom vocabulary
-        if CUSTOM_VOCABULARY_ENABLED:
-            transcribe_kwargs["vocabulary_name"] = VOCABULARY_NAME
 
-        stream = await client.start_stream_transcription(**transcribe_kwargs)
+        stream = await client.start_stream_transcription(
+            language_code=LANGUAGE_CODE,
+            media_sample_rate_hz=SAMPLE_RATE,
+            media_encoding='pcm',
+            number_of_channels=2,
+            enable_channel_identification=True,
+            vocabulary_name=VOCABULARY_NAME if CUSTOM_VOCABULARY_ENABLED else None
+        )
 
         handler = MyTranscriptResultStreamHandler(self, self.file_name, stream.output_stream)
         try:
             await asyncio.gather(
-                self.audio_stream_generator(stream),
+                audio_stream_generator(
+                self,
+                stream,
+                SAMPLE_RATE,
+                CHUNK_SIZE,
+                SAVE_AUDIO_ENABLED
+                ),
                 handler.handle_events(),
             )
         except asyncio.CancelledError:
